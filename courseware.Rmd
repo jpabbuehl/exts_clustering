@@ -1,0 +1,632 @@
+---
+title: "Exts clustering"
+output:
+ html_document: default
+---
+
+This Markdown document is the analytical pipeline for the course on hierarchica clustering in R.
+
+The dataset is the transcriptinal activity of breast cancer patients in NCI's Genomic Data Commons (previously known as TCGA).
+It describes the genetic activity of ~20'000 genes (in rows) in ~1'000 patients (in columns). Metadata are also provided, in order to perform extra downstream analysis.
+These dataset were already pre-processed from genomic to numeric values representing transcriptional activity (how much a gene is active).
+
+The scripts for collecting and preprocessing these datasets are beyond the scope of this tutorial, but are provided for traceability.
+The original data and associated metadata were fetched from GDC directly. Because it is time-consuming, I already provide a serial object rnaseq.rda corresponding to HTSeq-FPKM data level. You can skip the following chunk and directly go the next for the course.
+```{r, eval<- FALSE, include<- FALSE}
+# First go to this url:
+# https://gdc-portal.nci.nih.gov/search/f?filters<- %7B%22op%22:%22and%22,%22content%22:%5B%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22cases.project.project_id%22,%22value%22:%5B%22TCGA-BRCA%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.experimental_strategy%22,%22value%22:%5B%22RNA-Seq%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_type%22,%22value%22:%5B%22Gene%20Expression%20Quantification%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.data_category%22,%22value%22:%5B%22Transcriptome%20Profiling%22%5D%7D%7D,%7B%22op%22:%22in%22,%22content%22:%7B%22field%22:%22files.analysis.workflow_type%22,%22value%22:%5B%22HTSeq%20-%20FPKM-UQ%22%5D%7D%7D%5D%7D&facetTab<- files
+# Download a manifest.txt containing data id, then use GDC bash client to download all these files (as tar.gz) in a folder named 'rnaseq raw'. Total data volume is 638.28 MB 
+
+# Once finishid, run the script to process data into matrix
+tarfiles <- list.files(path='rnaseq raw',pattern='.gz$',recursive=TRUE)
+for(i in 1:length(tarfiles)){
+ dat <- read.table(gzfile(paste('rnaseq raw/',tarfiles[i],sep='')),stringsAsFactors=FALSE,row.names=1)
+ values <- dat[order(rownames(dat)),1]
+ if(i==1){
+  row_assert <- order(rownames(dat))
+  output <- matrix(data=NA,nrow=nrow(dat),ncol=length(tarfiles))
+  rownames(output) <- rownames(dat)[row_assert]
+ }
+ if(identical(row_assert,order(rownames(dat)))){
+  output[,i] <- values
+ } else {
+  stop('row orders are not identical')
+ }
+}
+
+# Fetch file's metadata
+uuid_samples <- read.table("gdc_manifest_20170213_052514.txt",header=TRUE)
+id <- toString(sprintf('"%s"', uuid_samples$id))
+Part1 <- '{"filters":{"op":"in","content":{"field":"files.file_id","value":[ '
+Part2 <- '] }},"format":"TSV","fields":"file_id,file_name,cases.submitter_id,cases.case_id,data_category,data_type,cases.samples.tumor_descriptor,cases.samples.tissue_type,cases.samples.sample_type,cases.samples.submitter_id,cases.samples.sample_id,cases.samples.portions.analytes.aliquots.aliquot_id,cases.samples.portions.analytes.aliquots.submitter_id","size":"3000"} '
+Sentence <- paste(Part1,id,Part2, collapse=" ")
+write.table(Sentence,"Payload.txt",quote=FALSE,col.names=FALSE,row.names=FALSE)
+system('curl --request POST --header "Content-Type: application/json" --data @Payload.txt "https://gdc-api.nci.nih.gov/files" > File_metadata.txt')
+
+# Process metadata
+file_info <- read.csv('File_metadata.txt',header=TRUE,sep='\t',stringsAsFactors=FALSE)
+file_info <- file_info[,c('file_name','cases_0_samples_0_submitter_id')]
+tarnames <- sub('.*/(*.)', "\\1", tarfiles)
+coordinates <- match(tarnames,file_info$file_name)
+if(!any(is.na(coordinates))){
+  file_info <- file_info[coordinates,]
+  colnames(output) <- file_info$cases_0_samples_0_submitter_id
+}
+save(output,file='dataset/BRCA.RNASeq_FPKM-UQ.rda')
+
+# Pre-process dataset
+load(file='dataset/BRCA.RNASeq_FPKM-UQ.rda')
+dat <- output[-1,]
+
+# For the sake of this course (and computation time), remove genes whose expression is null in more than 50% of samples
+rem <- function(x){
+  x <- as.matrix(x)
+  x <- t(apply(x,1,as.numeric))
+  r <- as.numeric(apply(x,1,function(i) sum(i==0)))
+  remove <- which(r>dim(x)[2]*0.5)
+  return(remove)
+}
+remove <- rem(dat)
+dat <- dat[-remove,]
+
+# Format samples names to match metadata
+colnames(dat) <- gsub('\\.','-',colnames(dat))
+colnames(dat) <- substr(colnames(dat),start=1,stop=16)
+
+# From TCGA data, data from normal tissue can be stored as comparaison. They are identified by their ID
+# Link: https://wiki.nci.nih.gov/display/TCGA/TCGA+barcode
+# Apply voom function to normalize the data, required for most downstream analysis
+normal_index <- which(substr(colnames(dat),14,14) == "1")
+tumor_index <- which(substr(colnames(dat),14,14) == "0")
+save(dat,file='data/rnaseq.rda')
+
+# Transform into a normal distribution
+library(limma)
+vm <- function(x,t_index,n_index){
+  cond <- factor(ifelse(seq(1,dim(x)[2],1) %in% t_index, 1,  0))
+  d <- model.matrix(~1+cond)
+  x <- t(apply(x,1,as.numeric))
+  ex <- voom(x,d,plot=F)
+  return(ex$E)
+}
+dat_vm  <- vm(dat,tumor_index,normal_index)
+colnames(dat_vm) <- colnames(dat)
+save(dat_vm,file='data/rnaseq_vm.rda')
+
+#Preparation of clinical metadata
+
+dat_clinical <- read.csv('data/BRCA.clin.merged.txt',header=FALSE,sep='\t')
+SubsetInfoIndex = c('admin.batch_number','patient.vital_status','patient.age_at_initial_pathologic_diagnosis','patient.breast_carcinoma_estrogen_receptor_status','patient.breast_carcinoma_progesterone_receptor_status','patient.gender','patient.lab_proc_her2_neu_immunohistochemistry_receptor_status','patient.histological_type','patient.race_list.race','patient.stage_event.pathologic_stage','patient.samples.sample.bcr_sample_barcode')
+SubsetMetadata <- dat_clinical[which(dat_clinical$V1 %in% SubsetInfoIndex),]
+
+# Fuse new tumor event after initial treatment
+ind_keep <- grep("days_to_new_tumor_event_after_initial_treatment",dat_clinical$V1)
+new_tum <- as.matrix(dat_clinical[ind_keep,])
+new_tum_collapsed <- c()
+for(i in 2:ncol(new_tum)){
+  if(sum(is.na(new_tum[,i])) < dim(new_tum)[1]){
+    m <- as.numeric(min(new_tum[,i],na.rm=T))
+    new_tum_collapsed <- c(new_tum_collapsed,m)
+  } else {
+    new_tum_collapsed <- c(new_tum_collapsed,NA)
+  }
+}
+
+# Fuse death event
+ind_keep <- grep("days_to_death",dat_clinical$V1)
+death <- as.matrix(dat_clinical[ind_keep,])
+death_collapsed <- c()
+for(i in 2:ncol(death)){
+  if(sum(is.na(death[,i])) < dim(death)[1]){
+    m <- as.numeric(max(death[,i],na.rm=T))
+    death_collapsed <- c(death_collapsed,m)
+  } else {
+    death_collapsed <- c(death_collapsed,NA)
+  }
+}
+
+# Fuse last follow-up event
+ind_keep <- grep("days_to_last_followup",dat_clinical$V1)
+fl <- as.matrix(dat_clinical[ind_keep,])
+fl_collapsed <- c()
+for(i in 2:ncol(fl)){
+  if(sum(is.na(fl[,i])) < dim(fl)[1]){
+    m <- as.numeric(max(fl[,i],na.rm=T))
+    fl_collapsed <- c(fl_collapsed,m)
+  } else {
+    fl_collapsed <- c(fl_collapsed,NA)
+  }
+}
+
+SubsetMetadata <- t(SubsetMetadata)
+colnames(SubsetMetadata)<-SubsetMetadata[grep('admin.batch_number',SubsetMetadata),]
+SubsetMetadata <- SubsetMetadata[-grep('admin.batch_number',SubsetMetadata),]
+rownames(SubsetMetadata)<-toupper(SubsetMetadata[,'patient.samples.sample.bcr_sample_barcode'])
+SubsetMetadata <- SubsetMetadata[,-grep('patient.samples.sample.bcr_sample_barcode',colnames(SubsetMetadata))]
+SubsetMetadata <- as.data.frame(SubsetMetadata)
+SubsetMetadata$patient.age_at_initial_pathologic_diagnosis<-as.numeric(SubsetMetadata$patient.age_at_initial_pathologic_diagnosis)
+
+SubsetMetadata$new_tumor_days <- new_tum_collapsed
+SubsetMetadata$death_days <- death_collapsed
+SubsetMetadata$followUp_days <- fl_collapsed
+
+# Format colnames for easier usage
+colnames(SubsetMetadata)
+new_colnames <- c('batch','age_at_diagnosis','ER_status','PR_status','gender','histological_type','HER2_status','ethnic','pathologic_stage','alive','new_tumor_days','death_days','followUp_days')
+colnames(SubsetMetadata) <- new_colnames
+
+# create vector with time to new tumor containing data to censor for new_tumor
+Meta <- SubsetMetadata
+Meta$new_time <- c()
+for (i in 1:length(Meta$new_tumor_days)){
+  Meta$new_time[i] <- ifelse(is.na(Meta$new_tumor_days[i]),Meta$followUp_days[i],Meta$new_tumor_days[i])
+}
+
+# create vector time to death containing values to censor for death
+Meta$new_death <- c()
+for (i in 1:length(Meta$death_days)){
+  Meta$new_death[i] <- ifelse(is.na(Meta$death_days[i]),Meta$followUp_days[i],Meta$death_days[i])
+}
+
+# create vector for death censoring
+Meta$death_event <- c()
+for (i in 1:length(Meta$alive)){
+  Meta$death_event[i] <- ifelse(Meta$alive[i]=='alive',0,1)
+}
+Meta$death_event <- as.factor(Meta$death_event)
+save(Meta,file='data/BRCA_clinical_metadata_censored.rda')
+```
+
+First, we will perform hierarchical clustering based on euclidean distance to see if we can distinguish normal vs tumor tissues. We will set the number of cluster to K=2
+```{r}
+library(dendextend) # For dendogram visualization
+library(dendextendRcpp) # For faster execution of dendextend functions
+library(colorspace) # To set colors bar
+library(wordspace) # dist.matrix is 10x faster than dist
+
+load('data/rnaseq_vm.rda')
+
+dend <- as.matrix(t(dat_vm)) %>% # clustering is row-based, so transposition is needed to cluster samples
+        dist.matrix(method = 'euclidean', as.dist=TRUE) %>% # calculate a distance matrix, default method = euclidean 
+        hclust(method = "complete") %>% # ohierarchical clustering , method = complete
+        as.dendrogram
+
+K = 2
+par(mar = c(1,5,2,1))
+labels_tissue = rep(1,ncol(dat_vm))
+normal_index <- which(substr(colnames(dat_vm),14,14) == "1")
+labels_tissue[normal_index] = 2
+cols <- c("white", "black")[labels_tissue]
+dend2 = dend %>%
+  set("branches_k_color", k = K) %>%
+  set("labels_cex", 0.001) %>%
+  set("branches_lwd", 2)
+plot(dend2, main = "Hierarchical Clustering tumor vs normal, set K=2")
+colored_bars(cols, dend2,y_shift = -7, rowLabels = paste("Normal Tissue"))
+```
+
+We see that normal tissues cluster together, except few that are far appart.
+Outliers could be tumor samples with significant contamination of normal tissues. It is frequent that the surgeon removes a significant margin of normal tissue as a precaution.
+
+We will now proceed with tumor samples only and observe if clustering correlates with clinical and technical factors.
+```{r}
+load('data/BRCA_clinical_metadata_censored.rda')
+
+# First remove samples without clinical metadata (normal tissue samples will also be removed)
+dat_vm <- dat_vm[,colnames(dat_vm) %in% rownames(Meta)]
+# Then reorder clinical metadata to fit dat_z2 columns order
+Meta <- Meta[match(colnames(dat_vm),rownames(Meta)),]
+
+hc <- as.matrix(t(dat_vm)) %>%
+      dist.matrix(method = 'euclidean', as.dist=TRUE) %>%
+      hclust(method = "complete")
+dend <- hc %>% as.dendrogram
+
+# Select columns you want to display on the dendogram
+factor_columns <- c('batch','gender','histological_type','pathologic_stage','alive','ethnic','ER_status','PR_status','HER2_status')
+Meta_short = Meta[,factor_columns]
+for(i in 1:ncol(Meta_short)){
+  color_palette<- rainbow_hcl(length(levels(Meta_short[,i])), c=90, l=50)
+  new_col <- color_palette[as.integer(Meta_short[,i])]
+  if(i>1){
+    cols = cbind(cols,new_col)
+    names = append(names, colnames(Meta_short)[i])
+  } else{
+    cols = new_col
+    names = c(colnames(Meta_short)[i])
+  }
+}
+cols[is.na(cols)]<-"#FFFFFF" # Replace NA with white
+par(mar = c(6,5,2,1))
+K = 3
+dend2 = dend %>%
+  set("branches_k_color", k = Kcluster) %>%
+  set("labels_cex", 0.001) %>%
+  set("branches_lwd", 2)
+plot(dend2, main = "Hierarchical clustering of breast tumor samples, set K=3")
+colored_bars(cols, dend2,y_shift = -12, rowLabels = names)
+```
+
+PR(progesterone receptor) and ER(estrogen receptor) status describe when a pathologist detects those signals on a tissue section and are often both present or absent. It is interesting to see that genomic activity can regroup those samples together.
+
+Let's determine is there is association between cluster membership and batch number.
+```{r}
+library(vcd)
+Meta_short$clusters <- as.factor(cutree(hc,3))
+levels(Meta_short$batch) <- seq(1:length(levels(Meta_short$batch))) # Rename batch ID to 1..n for plotting
+stat_category <- xtabs(~ clusters + batch,data=Meta_short)
+assoc(stat_category)
+summary(assocstats(stat_category))
+corrected_dat_vm <- removeBatchEffect(dat_vm,Meta_short$batch)
+save(corrected_dat_vm,file='data/rnaseq_vm_corrected.rda')
+```
+
+we can see that one cluster is extremly correlated with a particular batch. This batch effect is stronger that biological effect and prevents us finding good clusters. We will correct this by adding the batch factor in the model
+
+```{r}
+library(dynamicTreeCut) # To automatically cut dendogram depending on shape
+
+# First remove samples without clinical metadata (normal tissue samples will also be removed)
+corrected_dat_vm <- corrected_dat_vm[,colnames(corrected_dat_vm) %in% rownames(Meta)]
+# Then reorder clinical metadata to fit dat_z2 columns order
+Meta <- Meta[match(colnames(corrected_dat_vm),rownames(Meta)),]
+
+hc <- as.matrix(t(corrected_dat_vm)) %>%
+      dist.matrix(method = 'euclidean', as.dist=TRUE) %>%
+      hclust(method = "complete")
+dend <- hc %>% as.dendrogram
+
+clusters_members <- cutreeDynamic(hc, distM = as.matrix(dist(t(corrected_dat_vm))),method="tree")
+clusters <- clusters_members[order.dendrogram(dend)]
+clusters_numbers <- unique(clusters) - (0 %in% clusters)
+n_clusters <- length(clusters_numbers)
+hc_cols <- rainbow_hcl(n_clusters)
+
+# Select columns you want to display on the dendogram
+factor_columns <- c('batch','gender','histological_type','pathologic_stage','alive','ethnic','ER_status','PR_status','HER2_status')
+Meta_short = Meta[,factor_columns]
+for(i in 1:ncol(Meta_short)){
+  color_palette<- rainbow_hcl(length(levels(Meta_short[,i])), c=90, l=50)
+  new_col <- color_palette[as.integer(Meta_short[,i])]
+  if(i>1){
+    cols = cbind(cols,new_col)
+    names = append(names, colnames(Meta_short)[i])
+  } else{
+    cols = new_col
+    names = c(colnames(Meta_short)[i])
+  }
+}
+cols[is.na(cols)]<-"#FFFFFF" # Replace NA with white
+
+# Dendogram plot to see if clusters are enriched for characteristics
+par(mar = c(6,5,2,1))
+dend2 = dend %>%
+  branches_attr_by_clusters(clusters, values = hc_cols) %>% 
+  set("labels_cex", 0.001) %>%
+  set("branches_lwd", 2)
+plot(dend2, main = paste0("Batch-removed Clustering of 1090 breast tumor samples, dynamicTreeCut K=",n_clusters))
+colored_bars(cols, dend2,y_shift = -12, rowLabels = names)
+```
+
+The personalized medicine started with hierarchical clustering of genomic activity in breast cancer patients (just as we did) [CM Perou 2000, Nature](https://www.google.ch/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=0ahUKEwjF94aBhI3SAhVDP5oKHQNAAQcQFgghMAA&url=http%3A%2F%2Fwww.nature.com%2Fnature%2Fjournal%2Fv406%2Fn6797%2Ffull%2F406747a0.html&usg=AFQjCNEDDYNKuuNqkcl91nxHJdGaLvL2aQ&sig2=97TMxEksKPMB6mfION5USg). Stratifying patients into subgroups showed that each group had different survival and treatment sensitivity. Gene Signatures (=set of features) were used to assign patient to a cluster and recommend treatments showing benefits for other patients in the same cluster.
+
+PAM50 is diagnosic tool using the 50 most discriminative genes to stratify patients into 5 subtypes (normal-like, luminal A, luminal B, Her2 and Basal) and is used in clinic in the US. Let's compare it with our clustering.
+Of note, this technology was developped using DNA microarray while here we are using RNA sequencing technology that has become dominant nowadays.
+```{r}
+library(genefu) # Perform PAM50 diagnosis test to detect molecular subtypes
+
+# First we need to create annotation pipeline to match PAM50
+Gene.Symbol <- as.vector(sapply(rownames(corrected_dat_vm), function(x) unlist(strsplit(x,"\\|"))[[1]]))
+EntrezGene.ID <- as.vector(sapply(rownames(corrected_dat_vm), function(x) unlist(strsplit(x,"\\|"))[[2]]))
+probe <- rownames(corrected_dat_vm)
+annot.tcga <- data.frame(probe,Gene.Symbol,EntrezGene.ID)
+PAM50_subtypes <- molecular.subtyping(sbt.model='pam50',data=t(corrected_dat_vm),annot=annot.tcga,do.mapping=TRUE)
+
+# Hierarchical clustering with PAM50 prediction as colored bars
+dend <- as.matrix(t(corrected_dat_vm)) %>%
+        dist.matrix(method = 'euclidean', as.dist=TRUE) %>%
+        hclust(method = "complete") %>%
+        as.dendrogram
+
+cols = c()
+par(mar = c(4,4,2,1))
+for(i in 1:ncol(PAM50_subtypes$subtype.crisp)){
+  new_col <- c("white", "black")[as.integer(PAM50_subtypes$subtype.crisp[,i])+1]
+   if(i>1){
+    cols = cbind(cols,new_col)
+    names = append(names, colnames(PAM50_subtypes$subtype.crisp)[i])
+  } else{
+    cols = new_col
+    names = c(colnames(PAM50_subtypes$subtype.crisp)[i])
+  }
+}
+K=5
+names = gsub('Normal','Normal-like',names) # Change name according to terminology used in the field
+dend2 = dend %>%
+  set("branches_k_color", k = Kcluster) %>%
+  set("labels_cex", 0.001) %>%
+  set("branches_lwd", 2)
+plot(dend2, main = paste0("Batch-removed Clustering of 1090 breast tumor samples, set K=",K))
+colored_bars(cols, dend2,y_shift = -12, rowLabels = names)
+```
+
+Which methods in hierarchical clustering to choose ?
+Just to name a few:
+1. Scale: yes/no
+2a. Distance: Manhattan, Euclidean, Chebyshev, Canberra
+2b. Correlation: Pearson, Kendall, Spearman
+3. Linkage: Single, Complete, Average,Median, Ward, Centroid 
+Already 84 combinations possible !?!
+
+Let's prepare a figure showing relationship between each others.
+This step is computationally expensive but required for the following courses. I have saved the result as serialized objects so you can load them and continue with the next chunk
+```{r, eval<- FALSE, include<- FALSE}
+library(fastcluster) # For fast hclust
+library(coop) # Fast correlation function
+library(pcaPP) # Fast Kendall correlation function for large N
+
+corrected_dat_vm_scaled <- scale(corrected_dat_vm)
+
+# Distance methods
+# Minkowski is a generalization distance
+# p = 1 is the Manhattan distance
+# p = 2 is the Euclidean distance
+# p = ∞ is the Chebyshev distance (or maximum)
+hc_manhattan <- as.matrix(t(corrected_dat_vm)) %>% dist.matrix(method = 'minkowski', p=1, as.dist=TRUE)
+hc_euclidean <- as.matrix(t(corrected_dat_vm)) %>% dist.matrix(method = 'minkowski', p=2, as.dist=TRUE)
+hc_chebyshev <- as.matrix(t(corrected_dat_vm)) %>% dist.matrix(method = 'minkowski', p = 99, as.dist=TRUE)
+hc_canberra <- as.matrix(t(corrected_dat_vm)) %>% dist.matrix(method = 'canberra', as.dist=TRUE)
+
+hc_sc_manhattan <- as.matrix(t(corrected_dat_vm_scaled)) %>% dist.matrix(method = 'minkowski', p=1, as.dist=TRUE)
+hc_sc_euclidean <- as.matrix(t(corrected_dat_vm_scaled)) %>% dist.matrix(method = 'minkowski', p=2, as.dist=TRUE)
+hc_sc_chebyshev <- as.matrix(t(corrected_dat_vm_scaled)) %>% dist.matrix(method = 'minkowski', p = 99, as.dist=TRUE)
+hc_sc_canberra <- as.matrix(t(corrected_dat_vm_scaled)) %>% dist.matrix(method = 'canberra', as.dist=TRUE)
+
+# Correlation methods
+hc_pearson <- 1-abs(cor(as.matrix(corrected_dat_vm),method = 'pearson')) %>% as.dist
+hc_kendall <- 1-abs(cor.fk(as.matrix(corrected_dat_vm))) %>% as.dist
+hc_spearman <- 1-abs(cor(as.matrix(corrected_dat_vm),method = 'spearman')) %>% as.dist
+
+hc_sc_pearson <- 1-abs(cor(as.matrix(corrected_dat_vm_scaled),method = 'pearson')) %>% as.dist
+hc_sc_kendall <- 1-abs(cor.fk(as.matrix(corrected_dat_vm_scaled))) %>% as.dist
+hc_sc_spearman <- 1-abs(cor(as.matrix(corrected_dat_vm_scaled),method = 'spearman')) %>% as.dist
+
+#Complete, Single, Average, Median, Centroid, Ward
+distance_methods <- c('manhattan','euclidean','chebyshev','canberra')
+correlation_methods <- c('pearson','kendall','spearman')
+preproc_methods <- c('not_scaled','scaled')
+
+current <- list(hc_manhattan,hc_euclidean,hc_chebyshev,hc_canberra,
+                hc_sc_manhattan,hc_sc_euclidean,hc_sc_chebyshev,hc_sc_canberra,
+                hc_pearson,hc_kendall,hc_spearman,
+                hc_sc_pearson,hc_sc_kendall,hc_sc_spearman)
+
+names(current) <- c(paste(preproc_methods[1],distance_methods,sep=';'),
+                    paste(preproc_methods[2],distance_methods,sep=';'),
+                    paste(preproc_methods[1],correlation_methods,sep=';'),
+                    paste(preproc_methods[2],correlation_methods,sep=';'))
+
+save(current,file='list dissimilarities.rda')
+
+hclust_methods <- c("average","single","ward.D","complete","centroid","median")
+dend_output <- dendlist()
+list_output <- list()
+dend_name_output <- c()
+for(i in 1:length(current)){
+  current_hc <-current[[i]]
+  current_name <- names(current)[i]
+  for(hclust_method in hclust_methods){
+    dend_result <- current_hc %>%  fastcluster::hclust(method = hclust_method) %>% as.dendrogram
+    dend_output <- dendlist(dend_output, dend_result)
+    list_output <- c(list_output,list(dend_result))
+    dend_name_output <- append(dend_name_output,paste(current_name,hclust_method,sep=';'))
+  }
+}
+
+names(dend_output) <- dend_name_output
+names(list_output) <- dend_name_output
+save(dend_output, file='dendlist hclust.rda')
+save(list_output, file='list hclust.rda')
+
+# Cophenetic correlation matrix, this file is too big to upload on github.
+# Function too slow, need to speedup correlation function used internally, for that we use coop::pcor with optimally use openBLAS internally
+getAnywhere('cor')
+library('coop')
+unlockBinding('cor',as.environment("package:stats"))
+assign("cor", coop::pcor, "package:stats")
+unlockBinding('cor',getNamespace("stats"))
+assign("cor", coop::pcor, getNamespace("stats"))
+
+cor_cophenetic_dat <- cor.dendlist(dend_output, method = "cophenetic")
+save(cor_cophenetic_dat,file='list correlation cophenetic.rda')
+```
+
+# Find optimal K cluster
+
+1. Use silhouette width
+```{r}
+load(file='list hclusts.rda')
+# 1. Cut tree using pamK method and use silhouette approach 
+clusters_members <- list()
+nb_clusters <- rep(NA,length(list_output))
+for(i in 1:length(list_output)){
+  current_dend <- list_output[[i]]
+  dend_k <- find_k(current_dend,2:10)
+  nb_clusters[i] <- dend_k$nc
+  clusters_members <- c(clusters_members, list(dend_k$pamobject$clustering))
+}
+save(clusters_members,file='find_k results for all comparaison.rda')
+save(nb_clusters,file='find_k nbclusters for all comparaison.rda')
+
+# Filter for relevant results
+to_explore = nb_clusters > 2 & nb_clusters < 10
+clusters_members = clusters_members[to_explore]
+# Calculate agreement between clustering approaches
+library(flexclust)
+aggrement <- diag(1,nrow=length(clusters_members),ncol=length(clusters_members))
+for(i in 1:(length(clusters_members)-1)){
+  for(j in (i+1):length(clusters_members)){
+    ct.km <- randIndex(table(clusters_members[[i]], clusters_members[[j]]))
+    aggrement[i,j] <- as.numeric(ct.km)
+    aggrement[j,i] <- as.numeric(ct.km)
+  }
+}
+rename <- names(list_output[to_explore])
+rename <- paste(rename,';',nb_clusters[to_explore],'_clusters',sep='')
+rename <- gsub(';',' ',rename)
+
+rownames(aggrement) <- rename
+colnames(aggrement) <- rename
+par(mar = c(3,1,3,16))
+dend <- (1-abs(aggrement)) %>% as.dist %>% hclust %>% as.dendrogram
+dend %>% highlight_branches_lwd %>% plot(main = paste('Aggrement for optimal K\nusing silhouette',sep=''),horiz= TRUE)
+
+# Plot silhouette for selected answers - Scaled manhattan complete
+dend = list_output[[46]]
+dend_k <- find_k(dend)
+plot(dend_k)
+plot(color_branches(dend, k = dend_k$nc))
+```
+
+2. Use total within sum of square and silhouette
+```{r}
+library(stats)
+library(fpc)
+library(dendextend)
+# use stats to validate cluster
+load(file='list dissimilarities.rda')
+load(file='list hclust.rda')
+wss_result <- c()
+silhouette_result <- c()
+#Draw a line between point at K=1 and K=10, then find elbow at K when furtherst from the line
+wss_bestnc <- function(x){
+  topleft = c(1,x[1])
+  bottomright = c(length(x),x[length(x)])
+  v1 <- topleft - bottomright
+  output <- c()
+  for(i in 2:(length(x)-1)){
+    a = c(i,x[i])
+    v2 <- a - topleft
+    m <- cbind(v1,v2)
+    distance <- abs(det(m))/sqrt(sum(v1*v1))
+    output <- append(output,distance)
+  }
+  return(which.max(output)+1)
+} 
+
+for(i in 1:length(list_output)){
+  tree_condition <- list_output[[i]]
+  name_dissimilarity <- strsplit(names(list_output)[[i]],';')[[1]]
+  name_dissimilarity <- paste(name_dissimilarity[1],name_dissimilarity[2],sep=';')
+  diss_condition <- current[[name_dissimilarity]]
+  current_result_withinss <- c()
+  current_result_silhouette <- c()
+  for(k in 1:10){
+    members <- cutree(tree_condition,k)
+    res.stat <- cluster.stats(diss_condition,members, wgap=TRUE, silhouette=TRUE)$within.cluster.ss
+    current_result_withinss <- append(current_result_withinss, res.stat$within.cluster.ss)
+    current_result_silhouette <- append(current_result_silhouette,res.stat$avg.silwidth)
+  }
+  wss_result <- append(wss_result,wss_bestnc(current_result_withinss))
+  silhouette_result <- append(wss_result,which.max(current_current_result_silhouette))
+  names(wss_result)[length(wss_result)]<-names(list_output)[i]
+  names(silhouette_result)[length(silhouette_result)]<-names(list_output)[i]
+}
+table(wss_result)
+table(silhouette_result)
+```
+
+3. Use Gap statistics
+```{r}
+library(cluster)
+load('data/rnaseq_vm_corrected.rda')
+load(file='list hclust.rda')
+hclusCut <- function(tree, k) list(cluster = cutree(tree, k=k))
+result_gapstat <- c()
+for(i in length(list_output)){
+  current_dendrogram <- list_output[[i]]
+  res.gap <- clusGap(corrected_dat_vm, FUN=hclusCut,K.max=10, tree=current_dendrogram,B = 20,verbose=TRUE)
+  result_gapstat <- append(result_gapstat,with(res.gap ,maxSE(Tab[,"gap"],Tab[,"SE.sim"])))
+  names(result_gapstat)[length(result_gapstat)]<-names(list_output)[i]
+}
+table(result_gapstat)
+```
+
+4. Use ensembl of clustering criterion
+```{r}
+library(NbClust)
+library(flexclust)
+
+load(file='list dissimilarity matrices.rda')
+indicators = c('frey','mcclain','cindex','silhouette','dunn') #they are 24 others, but computation time is too much.
+hclust_methods <- c("average","single","ward.D","complete","centroid","median")
+
+nb_clusters = c()
+memb_clusters = list()
+condition_names = c()
+whichmedian <- function(x) which.min(abs(x - median(x)))
+
+for(i in 1:length(current)){
+  for(j in 1:length(hclust_methods)){
+    bestnc_indicator = c()
+    bestmemb_indicator = c()
+    for(k in 1:length(indicators)){
+      try({
+      res = NbClust(diss=current[[i]], distance = NULL, min.nc=2, max.nc=10, method = hclust_methods[j], index = indicators[k])
+      bestnc_indicator = append(bestnc_indicator,res$Best.nc['Number_clusters'])
+      bestmemb_indicator = c(bestmemb_indicator,list(res$Best.partition))
+      },silent=TRUE)
+    }
+    if(length(bestnc_indicator)>1){
+      index_median = whichmedian(bestnc_indicator)
+      nb_clusters = append(nb_clusters,bestnc_indicator[index_median])
+      memb_clusters = c(memb_clusters,list(bestmemb_indicator[[index_median]]))
+      condition_names = append(condition_names,paste(names(current)[i],hclust_methods[j],sep=';'))
+    }
+  }
+}
+
+# Filter for prediction between 3 and 9
+to_explore = nb_clusters > 2 & nb_clusters < 10
+clusters_members = memb_clusters[to_explore]
+condition_names = condition_names[to_explore]
+nb_clusters = nb_clusters[to_explore]
+
+# Calculate agreement between clustering approaches
+aggrement <- diag(1,nrow=length(clusters_members),ncol=length(clusters_members))
+for(i in 1:(length(clusters_members)-1)){
+  for(j in (i+1):length(clusters_members)){
+    ct.km <- randIndex(table(clusters_members[[i]], clusters_members[[j]]))
+    aggrement[i,j] <- as.numeric(ct.km)
+    aggrement[j,i] <- as.numeric(ct.km)
+  }
+}
+rename <- condition_names
+rename <- paste(rename,';',nb_clusters,'_clusters',sep='')
+rename <- gsub(';',' ',rename)
+rownames(aggrement) <- rename
+colnames(aggrement) <- rename
+par(mar = c(3,1,3,16))
+dend <- (1-abs(aggrement)) %>% as.dist %>% hclust %>% as.dendrogram
+dend %>% highlight_branches_lwd %>% plot(main = paste('Aggrement for optimal K using ensembl criterion',sep=''),horiz= TRUE)
+```
+
+5. Use external validition, such as GO biological database. See if clusters correlate with biological processes.
+```{r}
+# Computation time was too long (>5 days)
+# Maybe consider re-writing with fast C implementation and multithreading ?
+# For teaching purpose, I attached the code that worked only on small subset but not on whole dataset.
+library(Biobase)
+library(annotate)
+library(GO.db)
+library(org.Hs.eg.db)
+
+load('data/rnaseq_vm_corrected.rda')
+tumor_index <- which(substr(colnames(corrected_dat_vm),14,14) == "0")
+corrected_dat_vm <- corrected_dat_vm[,tumor_index]
+data <- as.matrix(t(scale(t(corrected_dat_vm))))
+rownames(data) <- as.vector(sapply(rownames(corrected_dat_vm), function(x) unlist(strsplit(x,"\\|"))[[2]]))
+res.bio <- clValid(data, 2:10, clMethods="hierarchical",validation="biological",annotation="org.Hs.eg.db",GOcategory="BP")
+optimalScores(res.bio)
+plot(res.bio)
+```
